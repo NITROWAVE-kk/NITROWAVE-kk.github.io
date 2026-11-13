@@ -80,6 +80,7 @@ def analyze(vault: Path):
 
     folder_notes, folder_chars = Counter(), Counter()
     tags, inlinks = Counter(), Counter()
+    edges = set()
     month_modified, month_created = Counter(), Counter()
     day_modified = Counter()
     total_chars = total_chars_nospace = total_links = embeds = unresolved = 0
@@ -117,7 +118,10 @@ def analyze(vault: Path):
             out += 1
             key = Path(name).stem.lower() if name.lower().endswith(".md") else name.split("/")[-1].lower()
             if key in by_stem:
-                inlinks[str(by_stem[key][0].relative_to(vault))] += 1
+                dst = str(by_stem[key][0].relative_to(vault))
+                inlinks[dst] += 1
+                if dst != str(rel):
+                    edges.add((str(rel), dst))
             else:
                 unresolved += 1
 
@@ -153,6 +157,21 @@ def analyze(vault: Path):
 
     for n in per_note:
         n["links_in"] = inlinks.get(n["path"], 0)
+
+    # リンク構造（名前を含まない番号だけのグラフ。動画のノード配置に使う）
+    degree = Counter()
+    for a, b in edges:
+        degree[a] += 1
+        degree[b] += 1
+    top_nodes = [p for p, _ in sorted(degree.items(), key=lambda kv: (-kv[1], kv[0]))[:90]]
+    node_idx = {p: i for i, p in enumerate(top_nodes)}
+    folder_order = [f for f, _ in folder_notes.most_common()]
+    folder_of = {n["path"]: n["folder"] for n in per_note}
+    graph = {
+        "nodes": [{"degree": degree[p], "folder": folder_order.index(folder_of[p])} for p in top_nodes],
+        "edges": sorted([node_idx[a], node_idx[b]] for a, b in edges if a in node_idx and b in node_idx),
+        "linked_notes": len(degree), "unique_edges": len(edges),
+    }
 
     now = datetime.now()
     mods = sorted(n["modified"] for n in per_note)
@@ -192,6 +211,7 @@ def analyze(vault: Path):
                 1 for d in day_modified
                 if (now - datetime.strptime(d, "%Y-%m-%d")).days < 30),
         },
+        "graph": graph,
         "other_file_types": dict(other_files.most_common()),
         "notes": sorted(per_note, key=lambda n: n["path"]),
     }

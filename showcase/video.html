@@ -1,0 +1,294 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Vault Showcase</title>
+<style>
+@font-face{font-family:"NSJ";font-weight:700;src:url(fonts/noto-sans-jp-latin-700-normal.woff2) format("woff2");unicode-range:U+0000-00FF,U+2000-206F,U+2190-21FF}
+@font-face{font-family:"NSJ";font-weight:700;src:url(fonts/noto-sans-jp-japanese-700-normal.woff2) format("woff2")}
+@font-face{font-family:"NSJ";font-weight:900;src:url(fonts/noto-sans-jp-latin-900-normal.woff2) format("woff2");unicode-range:U+0000-00FF,U+2000-206F,U+2190-21FF}
+@font-face{font-family:"NSJ";font-weight:900;src:url(fonts/noto-sans-jp-japanese-900-normal.woff2) format("woff2")}
+html,body{margin:0;background:#000}canvas{display:block;max-width:100vw;max-height:100vh}
+</style>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+'use strict';
+// ---- タイムライン（BPM120: 1拍=15フレーム, 1小節=60フレーム）----
+const W = 1920, H = 1080, FPS = 30, BEAT = 15, BAR = 60, N = 12000;
+const SC = [0, 2, 6, 10, 14, 17, 20].map(b => b * BAR);   // 各シーンの開始フレーム（music.py と同じ）
+const TOTAL = SC[6];
+const PAL = ['#3fd0ff', '#6a8bff', '#b46bff', '#ff5fa8', '#ffb347', '#5fffc0', '#2a4a9a'];
+const FONT = '"NSJ","Noto Sans JP","Noto Sans CJK JP",sans-serif';
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+const pctx = pc.getContext('2d');
+
+let C = null;            // content.json
+const shapes = [];       // シーンごとの粒子の目標位置
+const ph = new Float32Array(N), dl = new Float32Array(N);
+let ringAng, ringRad;
+
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const eio = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const eoc = t => 1 - Math.pow(1 - t, 3);
+const eoe = t => t >= 1 ? 1 : 1 - Math.pow(2, -10 * t);
+const fmt = n => Math.round(n).toLocaleString('en-US');
+
+function newShape() { return { x: new Float32Array(N), y: new Float32Array(N), c: new Uint8Array(N) }; }
+
+function buildShapes() {
+  const R = rng(20261113), G = () => { let u = 0; while (u === 0) u = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(6.2831853 * R()); };
+  for (let i = 0; i < N; i++) { ph[i] = R() * 6.2831853; dl[i] = R() * .35; }
+
+  // 0: 散らばった状態
+  let s = newShape();
+  for (let i = 0; i < N; i++) { s.x[i] = -100 + R() * (W + 200); s.y[i] = -100 + R() * (H + 200); s.c[i] = i % 6; }
+  shapes.push(s);
+
+  // 1: リンク構造のノードグラフ（content.graph = 実際のリンク。名前は持たない）
+  s = newShape();
+  {
+    const nodes = (C.graph && C.graph.nodes || []).map(n => ({ deg: n.degree, f: n.folder }));
+    const edges = (C.graph && C.graph.edges || []).filter(e => e[0] !== e[1]);
+    if (!nodes.length) for (let i = 0; i < Math.min(60, Math.max(1, C.totals.notes)); i++) nodes.push({ deg: 0, f: i % Math.max(1, C.folders.length) });
+    const cx = 1330, cy = 545, fset = [...new Set(nodes.map(n => n.f))];
+    for (const n of nodes) {
+      const a = fset.indexOf(n.f) / fset.length * 6.2831853 - 1.2, rr = fset.length > 1 ? 1 : 0;
+      n.hx = cx + Math.cos(a) * 330 * rr; n.hy = cy + Math.sin(a) * 270 * rr;
+      n.x = n.hx + G() * 90; n.y = n.hy + G() * 90;
+    }
+    for (let it = 0; it < 120; it++) {
+      for (let a = 0; a < nodes.length; a++) for (let b = a + 1; b < nodes.length; b++) {
+        const p = nodes[a], q = nodes[b]; let dx = q.x - p.x, dy = q.y - p.y, d = Math.hypot(dx, dy) || 1;
+        if (d < 62) { const k = (62 - d) / d * .5; p.x -= dx * k; p.y -= dy * k; q.x += dx * k; q.y += dy * k; }
+      }
+      for (const e of edges) {
+        const p = nodes[e[0]], q = nodes[e[1]]; const dx = q.x - p.x, dy = q.y - p.y, d = Math.hypot(dx, dy) || 1;
+        if (d > 170) { const k = (d - 170) / d * .04; p.x += dx * k; p.y += dy * k; q.x -= dx * k; q.y -= dy * k; }
+      }
+      for (const n of nodes) { n.x += (n.hx - n.x) * .02; n.y += (n.hy - n.y) * .02; n.x = clamp(n.x, 800, 1850); n.y = clamp(n.y, 110, 980); }
+    }
+    const cum = []; let tot = 0; for (const n of nodes) { tot += 5 + n.deg; cum.push(tot); }
+    const nNode = edges.length ? Math.floor(N * .5) : N;
+    for (let i = 0; i < N; i++) {
+      if (i < nNode) {
+        const r = R() * tot; let k = 0; while (cum[k] < r) k++;
+        const n = nodes[k], sd = 5 + Math.sqrt(n.deg) * 2.6;
+        s.x[i] = n.x + G() * sd; s.y[i] = n.y + G() * sd; s.c[i] = n.f % 6;
+      } else {
+        const e = edges[Math.floor(R() * edges.length)], p = nodes[e[0]], q = nodes[e[1]], t = R();
+        s.x[i] = p.x + (q.x - p.x) * t + G() * 1.3; s.y[i] = p.y + (q.y - p.y) * t + G() * 1.3; s.c[i] = 6;
+      }
+    }
+  }
+  shapes.push(s);
+
+  // 2: フォルダ別クラスタ（粒子数・面積ともノート数に比例）
+  s = newShape();
+  {
+    const F = C.folders, K = F.length, sum = F.reduce((a, f) => a + f.notes, 0) || 1, mx = Math.max(...F.map(f => f.notes), 1);
+    const rows = K > 3 ? 2 : 1, cols = Math.ceil(K / rows);
+    F.forEach((f, k) => {
+      const col = k % cols, row = Math.floor(k / cols);
+      f.cx = W / 2 + (col - (cols - 1) / 2) * 600; f.cy = rows === 1 ? 500 : (row ? 745 : 300);
+      f.r = Math.max(14, 140 * Math.sqrt(f.notes / mx));
+    });
+    let i = 0;
+    F.forEach((f, k) => {
+      const cnt = k === K - 1 ? N - i : Math.round(N * f.notes / sum);
+      for (let j = 0; j < cnt && i < N; j++, i++) {
+        const a = R() * 6.2831853, r = f.r * Math.sqrt(R());
+        s.x[i] = f.cx + Math.cos(a) * r; s.y[i] = f.cy + Math.sin(a) * r; s.c[i] = k % 6;
+      }
+    });
+  }
+  shapes.push(s);
+
+  // 3: 月別の棒グラフ（棒の高さ・粒子数とも件数に比例）
+  s = newShape();
+  {
+    const M = C.months, n = Math.max(1, M.length), sum = M.reduce((a, m) => a + m.count, 0) || 1, mx = Math.max(...M.map(m => m.count), 1);
+    const x0 = 170, x1 = 1750, slot = (x1 - x0) / n, bw = Math.min(150, slot * .62), base = 880, maxH = 500;
+    let i = 0;
+    M.forEach((m, k) => {
+      m.cx = x0 + slot * (k + .5); m.h = maxH * m.count / mx; m.bw = bw; m.base = base;
+      const cnt = Math.round(N * m.count / sum);
+      for (let j = 0; j < cnt && i < N; j++, i++) {
+        s.x[i] = m.cx + (R() - .5) * bw; s.y[i] = base - R() * m.h; s.c[i] = (k % 2) ? 1 : 0;
+      }
+    });
+    for (; i < N; i++) { s.x[i] = x0 + R() * (x1 - x0); s.y[i] = base + 6 + R() * 3; s.c[i] = 6; }
+  }
+  shapes.push(s);
+
+  // 4: 回転するリング
+  s = newShape(); ringAng = new Float32Array(N); ringRad = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const inner = i % 4 === 0;
+    ringAng[i] = R() * 6.2831853; ringRad[i] = (inner ? 190 : 330) + G() * (inner ? 10 : 24);
+    s.c[i] = inner ? 4 : (i % 3 === 0 ? 2 : 1);
+  }
+  shapes.push(s);
+
+  // 5: 最後のメッセージ文字へ集合
+  s = newShape();
+  {
+    const tc = document.createElement('canvas'); tc.width = W; tc.height = H; const t = tc.getContext('2d', { willReadFrequently: true });
+    const lines = C.final; let size = 260;
+    t.font = `900 ${size}px ${FONT}`;
+    const wmax = Math.max(...lines.map(l => t.measureText(l).width));
+    size = Math.min(size, Math.floor(size * 1560 / wmax)); if (lines.length > 1) size = Math.min(size, 210);
+    t.font = `900 ${size}px ${FONT}`; t.textAlign = 'center'; t.textBaseline = 'middle'; t.fillStyle = '#fff';
+    const lh = size * 1.18, y0 = 440 - (lines.length - 1) * lh / 2;
+    lines.forEach((l, k) => t.fillText(l, W / 2, y0 + k * lh));
+    const d = t.getImageData(0, 0, W, H).data, pts = [];
+    for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) if (d[(y * W + x) * 4 + 3] > 128) pts.push(x, y);
+    const m = pts.length / 2;
+    for (let i = 0; i < N; i++) {
+      const k = Math.floor(R() * m);
+      s.x[i] = pts[k * 2] + R() * 2; s.y[i] = pts[k * 2 + 1] + R() * 2; s.c[i] = Math.min(5, Math.floor((s.x[i] - 180) / 1560 * 6 + R() * .8)) % 6;
+      if (s.c[i] < 0) s.c[i] = 0;
+    }
+  }
+  shapes.push(s);
+}
+
+// ---- 粒子 ----
+function drawParticles(f) {
+  const t = f / FPS;
+  let k = 0; for (let j = 1; j < 6; j++) if (f >= SC[j] - 8) k = j;
+  const a = Math.max(0, k - 1), p = k === 0 ? 1 : clamp((f - (SC[k] - 8)) / 30);
+  const A = shapes[a], B = shapes[k];
+  const kickOn = f >= SC[1] && !(f >= SC[5] - BAR && f < SC[5]) && f < SC[6] - BAR;
+  const pulse = kickOn ? Math.exp(-((f % BEAT) / BEAT) * 5) : 0;
+  const rot = t * .35, wob = k === 0 ? 16 : (k === 5 ? 1.2 : 2.6);
+  const xs = new Float32Array(N), ys = new Float32Array(N), cs = new Uint8Array(N);
+  const pos = (S, idx, i) => idx === 4
+    ? [1470 + Math.cos(ringAng[i] + rot * (i % 4 === 0 ? -1.6 : 1)) * ringRad[i], 540 + Math.sin(ringAng[i] + rot * (i % 4 === 0 ? -1.6 : 1)) * ringRad[i]]
+    : [S.x[i], S.y[i]];
+  for (let i = 0; i < N; i++) {
+    const e = eio(clamp((p - dl[i]) / .65));
+    const [ax, ay] = pos(A, a, i), [bx, by] = pos(B, k, i);
+    const sw = Math.sin(Math.PI * e) * 70;
+    let x = ax + (bx - ax) * e + Math.cos(ph[i]) * sw + Math.sin(t * 1.3 + ph[i]) * wob;
+    let y = ay + (by - ay) * e + Math.sin(ph[i]) * sw + Math.cos(t * 1.1 + ph[i] * 1.7) * wob;
+    if (k === 0) { x += Math.sin(t * .4 + ph[i] * 3) * 30; y += Math.cos(t * .3 + ph[i] * 2) * 30; }
+    x = W / 2 + (x - W / 2) * (1 + .010 * pulse); y = H / 2 + (y - H / 2) * (1 + .010 * pulse);
+    xs[i] = x; ys[i] = y; cs[i] = e > .5 ? B.c[i] : A.c[i];
+  }
+  pctx.globalCompositeOperation = 'source-over'; pctx.clearRect(0, 0, W, H);
+  pctx.globalCompositeOperation = 'lighter';
+  const sz = 2.2 + pulse * .5;
+  for (let c = 0; c < 7; c++) {
+    pctx.fillStyle = PAL[c]; pctx.globalAlpha = (c === 6 ? .5 : .62) + pulse * .12;
+    for (let i = 0; i < N; i++) if (cs[i] === c) pctx.fillRect(xs[i] - sz / 2, ys[i] - sz / 2, sz, sz);
+  }
+  pctx.globalAlpha = 1;
+}
+
+// ---- 文字 ----
+function txt(s, x, y, size, o = {}) {
+  const a = o.a === undefined ? 1 : o.a; if (a <= 0.002) return;
+  ctx.save();
+  ctx.font = `${o.w || 900} ${size}px ${FONT}`; ctx.textAlign = o.align || 'left'; ctx.textBaseline = 'alphabetic';
+  if (o.ls) ctx.letterSpacing = o.ls + 'px';
+  const w = ctx.measureText(s).width;
+  if (o.maxW && w > o.maxW) {
+    const k = o.maxW / w; ctx.translate(x, y); ctx.scale(k, k); x = 0; y = 0;
+  }
+  ctx.globalAlpha = a;
+  ctx.shadowColor = 'rgba(0,0,8,.9)'; ctx.shadowBlur = 26; ctx.fillStyle = 'rgba(0,0,8,.55)';
+  ctx.fillText(s, x, y); ctx.fillText(s, x, y);
+  ctx.shadowColor = o.glow || 'rgba(90,170,255,.55)'; ctx.shadowBlur = o.glowBlur === undefined ? 18 : o.glowBlur; ctx.fillStyle = o.color || '#fff';
+  ctx.fillText(s, x, y);
+  ctx.restore();
+}
+// f0 から現れる（下からスライド＋フェード）
+function inAt(f, f0, dur = 9) { const e = eoc(clamp((f - f0) / dur)); return { a: e, dy: (1 - e) * 46 }; }
+
+function drawText(f) {
+  let s = 0; for (let j = 1; j < 6; j++) if (f >= SC[j]) s = j;
+  const lf = f - SC[s], out = clamp((SC[s + 1] - f) / 7), T = C.totals;
+  const head = (label, f0 = 0) => { const v = inAt(lf, f0); txt(label, 120, 128 + v.dy * .4, 46, { a: v.a * out, color: '#8fdcff', w: 900 }); };
+
+  if (s === 0) {
+    txt('OBSIDIAN VAULT SHOWCASE', 120, 110, 26, { a: inAt(lf, 4).a * out, color: '#8fdcff', w: 700, ls: 8 });
+    let v = inAt(lf, BEAT * 2); txt(C.title[0], W / 2, 480 + v.dy, 124, { a: v.a * out, align: 'center', maxW: 1700 });
+    v = inAt(lf, BEAT * 4); txt(C.title[1], W / 2, 670 + v.dy, 170, { a: v.a * out, align: 'center', color: '#7fe0ff', maxW: 1700 });
+    v = inAt(lf, BEAT * 6); txt(C.subtitle, W / 2, 800 + v.dy, 40, { a: v.a * out, align: 'center', w: 700, color: '#cfd8ff', maxW: 1700 });
+  } else if (s === 1) {
+    const rows = [['ノート', T.notes], ['[[リンク]]', T.links], ['文字', T.chars]];
+    rows.forEach((r, k) => {
+      const f0 = k * BEAT * 4, v = inAt(lf, f0), y = 365 + k * 232;
+      txt(r[0], 124, y - 128 + v.dy, 38, { a: v.a * out, color: '#8fdcff', w: 700 });
+      txt(fmt(r[1] * eoe(clamp((lf - f0) / 26))), 116, y + v.dy, 142, { a: v.a * out, maxW: 640 });
+    });
+    const v = inAt(lf, BEAT * 12);
+    txt(`タグ ${fmt(T.tags)}種　／　フォルダ ${fmt(T.folders)}`, 124, 975 + v.dy, 38, { a: v.a * out, w: 700, color: '#cfd8ff', maxW: 640 });
+  } else if (s === 2) {
+    head(C.folders_title);
+    C.folders.forEach((fo, k) => {
+      const f0 = 10 + k * BEAT, v = inAt(lf, f0);
+      txt(fmt(fo.notes * eoe(clamp((lf - f0) / 20))), fo.cx, fo.cy + 208 + v.dy * .5, 58, { a: v.a * out, align: 'center' });
+      txt(fo.name, fo.cx, fo.cy + 252 + v.dy * .5, 30, { a: v.a * out, align: 'center', w: 700, color: PAL[k % 6], maxW: 540, glowBlur: 0 });
+    });
+  } else if (s === 3) {
+    head(C.months_title);
+    const M = C.months, small = M.length > 8;
+    M.forEach((m, k) => {
+      const f0 = 8 + Math.round(k * (BEAT * 6 / Math.max(1, M.length))), v = inAt(lf, f0);
+      txt(fmt(m.count * eoe(clamp((lf - f0) / 18))), m.cx, m.base - m.h - 18 + v.dy * .4, small ? 34 : 44, { a: v.a * out, align: 'center' });
+      txt(m.ym.slice(2).replace('-', '/'), m.cx, m.base + 52, small ? 26 : 32, { a: v.a * out, align: 'center', w: 700, color: '#aeb9e6', glowBlur: 0 });
+    });
+    let v = inAt(lf, BEAT * 8);
+    txt(`${C.activity.last30_label}　${fmt(C.activity.last30 * eoe(clamp((lf - BEAT * 8) / 20)))}`, W - 120, 128 + v.dy * .4, 46, { a: v.a * out, align: 'right', maxW: 900 });
+    v = inAt(lf, BEAT * 10);
+    txt(C.activity.range, W - 120, 190 + v.dy * .4, 34, { a: v.a * out, align: 'right', w: 700, color: '#aeb9e6' });
+  } else if (s === 4) {
+    head(C.lines_title);
+    const L = C.lines.slice(0, 6), step = Math.max(BEAT, Math.floor(BEAT * 9 / Math.max(1, L.length) / BEAT) * BEAT);
+    const gap = Math.min(128, 760 / Math.max(1, L.length)), y0 = 600 - (L.length - 1) * gap / 2;
+    L.forEach((l, k) => { const v = inAt(lf, 8 + k * step); txt(l, 120 + (1 - v.a) * -40, y0 + k * gap, 62, { a: v.a * out, maxW: 960 }); });
+  } else {
+    let v = inAt(lf, BEAT * 3); txt(C.final_sub, W / 2, 760 + v.dy, 50, { a: v.a, align: 'center', maxW: 1700 });
+    v = inAt(lf, BEAT * 5); txt(`Obsidian Vault の実データをスクリプトで集計（${C.generated_at.slice(0, 10)}）`, W / 2, 840 + v.dy, 30, { a: v.a, align: 'center', w: 700, color: '#aeb9e6' });
+    v = inAt(lf, BEAT * 7); txt('映像も音楽もコードだけで生成', W / 2, 900 + v.dy, 30, { a: v.a, align: 'center', w: 700, color: '#aeb9e6' });
+  }
+  if (C.sample) {
+    ctx.save(); ctx.fillStyle = 'rgba(200,20,40,.92)'; ctx.fillRect(W - 700, 0, 700, 54);
+    ctx.font = `900 28px ${FONT}`; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.fillText('SAMPLE DATA ― 実データではありません', W - 350, 38); ctx.restore();
+  }
+}
+
+// ---- 1フレーム描画（時刻の純関数）----
+function renderFrame(n) {
+  const f = clamp(n, 0, TOTAL - 1);
+  drawParticles(f);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; ctx.filter = 'none';
+  const g = ctx.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, 1150);
+  g.addColorStop(0, '#0b1026'); g.addColorStop(1, '#030409'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.filter = 'blur(18px)'; ctx.globalAlpha = .85; ctx.drawImage(pc, 0, 0);
+  ctx.filter = 'blur(5px)'; ctx.globalAlpha = .7; ctx.drawImage(pc, 0, 0);
+  ctx.filter = 'none'; ctx.globalAlpha = 1; ctx.drawImage(pc, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  drawText(f);
+  // 場面転換のフラッシュ / 冒頭・末尾のフェード
+  let fl = 0; for (let j = 1; j < 6; j++) if (f >= SC[j]) fl = .3 * Math.exp(-(f - SC[j]) / 4);
+  if (fl > .004) { ctx.fillStyle = `rgba(200,225,255,${fl})`; ctx.fillRect(0, 0, W, H); }
+  const fade = Math.max(1 - clamp(f / 12), clamp((f - (TOTAL - 20)) / 18));
+  if (fade > 0) { ctx.fillStyle = `rgba(0,0,0,${fade})`; ctx.fillRect(0, 0, W, H); }
+}
+
+window.ready = (async () => {
+  const q = new URLSearchParams(location.search);
+  C = await (await fetch(q.get('content') || 'content.json')).json();
+  await Promise.all([700, 900].map(w => document.fonts.load(`${w} 40px "NSJ"`, 'あ漢A1')));
+  await document.fonts.ready;
+  buildShapes();
+  window.TOTAL_FRAMES = TOTAL;
+  if (q.has('play')) { const t0 = performance.now(); const loop = () => { renderFrame(Math.floor((performance.now() - t0) / 1000 * FPS) % TOTAL); requestAnimationFrame(loop); }; loop(); }
+  else renderFrame(+q.get('f') || 0);
+  return TOTAL;
+})();
+</script>
